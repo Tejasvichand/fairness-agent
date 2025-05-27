@@ -1,0 +1,6 @@
+# config.yaml
+model_path: "sample_model.pkl"
+data_path: "sample_data.csv"
+protected_attribute: "gender"
+features: ["income", "age", "credit_score"]
+threshold: 0.1
