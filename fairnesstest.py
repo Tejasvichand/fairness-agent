@@ -16,7 +16,6 @@ def run_fairness_test(config_path):
     df['prediction'] = y_pred
 
     group = df[config['protected_attribute']]
-    score = selection_rate(df['prediction'])
     metric = MetricFrame(metrics=selection_rate, y_pred=df['prediction'], sensitive_features=group)
     disparity = demographic_parity_difference(df['prediction'], sensitive_features=group)
 
