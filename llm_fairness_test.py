@@ -1,125 +1,112 @@
-# llm_fairness_test.py (UPDATED with robust LLMWrapper.predict logic)
-import yaml
-import json
-import requests
-from giskard import Dataset, Model, scan
 import pandas as pd
-import os
+import numpy as np # For handling potential NaN values gracefully
 
-def run_llm_fairness_test(config_path):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+class FairnessChecker:
+    def __init__(self, df: pd.DataFrame, prediction_col: str, protected_attr: str, positive_label=1, reference_group=None):
+        self.df = df.copy()
+        self.prediction_col = prediction_col
+        self.protected_attr = protected_attr
+        self.positive_label = positive_label
+        self.groups = df[protected_attr].unique()
+        self.reference_group = reference_group
 
-    prompts = config['prompts']
-    api_key = os.getenv("OPENAI_API_KEY", config.get('api_key', ''))
+        # Basic validation for protected attribute and prediction column
+        if self.protected_attr not in self.df.columns:
+            raise ValueError(f"Protected attribute '{self.protected_attr}' not found in DataFrame.")
+        if self.prediction_col not in self.df.columns:
+            raise ValueError(f"Prediction column '{self.prediction_col}' not found in DataFrame.")
 
-    if not api_key or api_key == "your_openai_api_key_here":
-        print("Warning: OpenAI API key not set. Set OPENAI_API_KEY or update llm_config.yaml.")
+        # Ensure at least two groups for meaningful comparison
+        if len(self.groups) < 2:
+            raise ValueError(f"Protected attribute '{self.protected_attr}' must have at least two unique groups for fairness metrics. Found: {self.groups}")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    rows = []
+        # If reference_group is specified, ensure it exists
+        if self.reference_group is not None and self.reference_group not in self.groups:
+            raise ValueError(f"Reference group '{self.reference_group}' not found in unique groups of '{self.protected_attr}'. Found: {self.groups}")
 
-    # --- Initial data collection (prompts and responses) ---
-    # This part collects the initial sample responses from your LLM to create the starting dataset
-    for group, prompt_list in prompts.items():
-        for prompt in prompt_list:
-            output = ""
-            try:
-                response = requests.post(
-                    config['endpoint'],
-                    headers=headers,
-                    json={
-                        "model": config['model'],
-                        "messages": [{"role": "user", "content": prompt}]
-                    },
-                    timeout=30
-                )
-                response.raise_for_status()
-                output = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            except requests.exceptions.RequestException as e:
-                print(f"API call failed for group '{group}' prompt '{prompt}': {e}")
-                output = f"API_ERROR: {e}"
-            except Exception as e:
-                print(f"An unexpected error occurred for group '{group}', prompt '{prompt}': {e}")
-                output = f"UNEXPECTED_ERROR: {e}"
-            rows.append({"prompt": prompt, "response": output, "group": group})
-
-    df = pd.DataFrame(rows)
-
-    dataset = Dataset(
-        df,
-        target=None,  # No target column for LLM text generation
-        column_types={
-            "group": "category",
-            "prompt": "text",
-            "response": "text"
-        }
-    )
-
-    # --- UPDATED LLMWrapper: Handles both existing responses and generating new ones ---
-    class LLMWrapper:
-        def predict(self, df: pd.DataFrame):
-            # If the DataFrame coming from Giskard already has a 'response' column
-            # (e.g., it's the original dataset), just return those responses.
-            # We also check if all values are null, meaning it might be an empty column
-            # in a generated dataset that needs new responses.
-            if "response" in df.columns and not df["response"].isnull().all():
-                return df["response"].astype(str).tolist()
+    def _calculate_favorable_rate_per_group(self):
+        """Calculates the proportion of favorable outcomes for each group."""
+        favorable_rates = {}
+        for group in self.groups:
+            group_df = self.df[self.df[self.protected_attr] == group]
+            if not group_df.empty:
+                # Calculate mean, convert to float to handle potential np.nan if subgroup is empty
+                rate = (group_df[self.prediction_col] == self.positive_label).mean()
+                favorable_rates[group] = float(rate) if pd.notna(rate) else 0.0 # Handle NaN for empty subgroups
             else:
-                # If 'response' column is missing or empty, it means Giskard wants
-                # us to generate new responses for the 'prompt' column.
-                if "prompt" not in df.columns:
-                    raise ValueError("DataFrame must contain a 'prompt' column for LLM input.")
+                favorable_rates[group] = 0.0 # No samples for this group
 
-                generated_responses = []
-                for prompt_text in df["prompt"]:
-                    llm_output = ""
-                    try:
-                        # Make API call to your LLM here to generate new responses
-                        # Access config and headers from the outer scope (closure)
-                        llm_response = requests.post(
-                            config['endpoint'],
-                            headers=headers,
-                            json={
-                                "model": config['model'],
-                                "messages": [{"role": "user", "content": prompt_text}]
-                            },
-                            timeout=30
-                        )
-                        llm_response.raise_for_status()
-                        llm_output = llm_response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                    except requests.exceptions.RequestException as e:
-                        print(f"LLMWrapper API call failed for prompt '{prompt_text}': {e}")
-                        llm_output = f"API_ERROR: {e}"
-                    except Exception as e:
-                        print(f"LLMWrapper unexpected error for prompt '{prompt_text}': {e}")
-                        llm_output = f"UNEXPECTED_ERROR: {e}"
-                    generated_responses.append(llm_output)
-                return generated_responses
+        return favorable_rates
 
-    wrapped_model = Model(
-        model=LLMWrapper().predict,
-        model_type="text_generation",
-        name="LLM Fairness Agent",
-        description="Evaluates if an LLM generates biased responses based on demographic prompt differences.",
-        feature_names=["prompt"],
-        output_feature="response"
-    )
+    def statistical_parity_gap(self):
+        """
+        Calculates the Statistical Parity Gap (SPG) as max(rate) - min(rate) across all groups.
+        A positive gap indicates the group with the highest favorable outcome rate.
+        """
+        favorable_rates = self._calculate_favorable_rate_per_group()
+        
+        if not favorable_rates: # Should not happen if len(self.groups) >= 2
+            return np.nan # Or raise an error
 
-    print("Running Giskard scan for LLM fairness...")
-    # Keep raise_exceptions=True to get detailed error messages if detectors fail
-    report = scan(wrapped_model, dataset, raise_exceptions=True)
-    print("Giskard scan complete.")
+        max_rate = max(favorable_rates.values())
+        min_rate = min(favorable_rates.values())
 
-    overall_llm_status = "Pass"
-    if report.has_issues():
-        overall_llm_status = "Fairness Violation (Giskard Issues Detected)"
+        return float(max_rate - min_rate)
 
-    return {
-        "test_type": "LLM fairness comparison (Giskard)",
-        "overall_status": overall_llm_status,
-        "giskard_report": json.loads(report.to_json())
-    }
+    def disparate_impact_ratio(self):
+        """
+        Calculates the Disparate Impact Ratio (DI).
+        If reference_group is specified, it compares each non-reference group to the reference group.
+        Otherwise, it calculates max(rate) / min(rate).
+        """
+        favorable_rates = self._calculate_favorable_rate_per_group()
+
+        if not favorable_rates or len(favorable_rates) < 2:
+            return {} if self.reference_group is not None else np.nan # Return empty dict if not enough groups
+
+        if self.reference_group:
+            if self.reference_group not in favorable_rates or favorable_rates[self.reference_group] == 0:
+                print(f"Warning: Reference group '{self.reference_group}' has zero or no favorable outcomes. DI ratios involving it will be undefined.")
+                # Decide how to handle: skip, return infinity, or NaN
+                # For robustness, we'll return NaN for that specific ratio.
+                ref_rate = favorable_rates[self.reference_group]
+            else:
+                ref_rate = favorable_rates[self.reference_group]
+
+            ratios = {}
+            for group, rate in favorable_rates.items():
+                if group != self.reference_group:
+                    if ref_rate > 0:
+                        ratios[f"DI({group} vs {self.reference_group})"] = float(rate / ref_rate)
+                    else:
+                        ratios[f"DI({group} vs {self.reference_group})"] = np.inf if rate > 0 else np.nan
+            return ratios
+        else:
+            # If no reference group, return max/min ratio (less informative for multi-group)
+            max_rate = max(favorable_rates.values())
+            min_rate = min(favorable_rates.values())
+            if min_rate > 0:
+                return float(max_rate / min_rate)
+            else:
+                return np.inf if max_rate > 0 else np.nan # Division by zero scenario
+
+    def report(self):
+        """Generates a structured dictionary report of fairness metrics."""
+        report_data = {
+            "protected_attribute": self.protected_attr,
+            "positive_label": self.positive_label,
+            "groups_found": list(self.groups),
+            "favorable_outcome_rates_per_group": self._calculate_favorable_rate_per_group()
+        }
+
+        try:
+            report_data["statistical_parity_gap"] = self.statistical_parity_gap()
+        except ValueError as e:
+            report_data["statistical_parity_gap"] = f"Error: {e}"
+
+        try:
+            report_data["disparate_impact_ratio"] = self.disparate_impact_ratio()
+        except ValueError as e:
+            report_data["disparate_impact_ratio"] = f"Error: {e}"
+        
+        return report_data

@@ -6,3 +6,5 @@ __pycache__/
 
 # Giskard results (optional, but good practice to keep repo clean)
 results/
+# OpenAI API key configuration file
+llm_config.yaml
